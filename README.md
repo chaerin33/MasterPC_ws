@@ -22,7 +22,7 @@ MasterPC_ws/src/
       GetPlan.srv
     action/
       NavTask.action          ← 자율주행팀 인터페이스
-      WbTask.action           ← 오린팀 인터페이스
+      WbTask.action           ← Manipulation팀 인터페이스
 
   sml_system_pkg/            # 시스템 노드 패키지
     sml_system_pkg/
@@ -56,7 +56,7 @@ sml_planning_node   sml_manager_node
               ┌──────────┼──────────┐
               ↓          ↓          ↓
         amr_nav_node  amr_robot_node  workbench_node
-        (자율주행팀)   (우리팀)        (오린팀)
+        (자율주행팀)    (Manipulation)  (Manipulation)
 ```
 
 | 구분 | 방식 | 이름 | 설명 |
@@ -65,7 +65,7 @@ sml_planning_node   sml_manager_node
 | 스텝 전달 | Service | `/sml/get_plan` | manager 요청 → planning 응답 |
 | AMR 이동 | Action | `navigate_to_station` | manager → 자율주행팀 |
 | AMR 팔 | Service | `/amr_robot_command` | manager → amr_robot_node |
-| 워크벤치 | Action | `wb_task` | manager → 오린팀 |
+| 워크벤치 | Action | `wb_task` | manager → Manipulation |
 | 상태 모니터링 | Topic | `/sml/status` | manager 발행 |
 
 ---
@@ -88,7 +88,7 @@ bool   success
 string fail_reason      # "NAV_FAILED" / "OBSTACLE" / "TIMEOUT"
 ```
 
-### WbTask.action (오린팀 전달용)
+### WbTask.action (Manipulation 전달용)
 
 ```
 # Goal
@@ -144,7 +144,7 @@ string  message
 
 ---
 
-## ⚙️ 의존성
+## ⚙️
 
 이 워크스페이스는 `amr_robot_ws`의 `arm_interfaces` 패키지를 참조합니다.
 **반드시 `amr_robot_ws`를 먼저 빌드하고 source해야 합니다.**
@@ -166,11 +166,6 @@ cd ~/robocup/MasterPC_ws
 colcon build
 source install/setup.bash
 ```
-
-> conda 환경이 활성화된 상태라면 빌드 전에 PATH를 먼저 잡아주세요:
-> ```bash
-> export PATH=/usr/bin:/usr/local/bin:/opt/ros/humble/bin:$PATH
-> ```
 
 ---
 
@@ -213,27 +208,14 @@ ros2 node list
 
 ---
 
-## 👥 팀원 환경 설정
-
-`~/.bashrc`에 아래 줄을 추가하면 터미널 열 때마다 자동으로 환경이 잡힙니다:
-
-```bash
-source /opt/ros/humble/setup.bash
-source ~/robocup/amr_robot_ws/install/setup.bash
-source ~/robocup/MasterPC_ws/install/setup.bash
-```
-
----
 
 ## 🔗 연관 저장소
 
 | 저장소 | 담당 | 설명 |
 |--------|------|------|
-| [MasterPC_ws](https://github.com/chaerin33/MasterPC_ws) | 우리팀 | 이 저장소 |
-| [amr_robot_ws](https://github.com/chaerin33/amr_robot_ws) | 우리팀 | AMR 로봇팔 제어 |
+| [MasterPC_ws](https://github.com/chaerin33/MasterPC_ws) | - | 이 저장소 |
+| [amr_robot_ws](https://github.com/chaerin33/amr_robot_ws) | Manipulation | AMR 로봇팔 제어 |
 | amr_nav_ws | 자율주행팀 | AMR 자율주행 |
-| workbench_ws | 오린팀 | 워크벤치 제어 |
+| workbench_ws | Manipulation | 워크벤치 제어 |
 
 ---
-
-*이 문서는 Claude와의 대화에서 확정된 설계 내용을 바탕으로 작성되었습니다.*
