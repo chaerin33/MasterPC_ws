@@ -48,10 +48,10 @@ MasterPC_ws/src/
 ```
 sml_order_server
       ↓ Topic /sml/task
-  ┌───┴──────────────┐
-  ↓                  ↓
-sml_planning_node   sml_manager_node
-                         ↑ Service /sml/get_plan
+  ┌───┴──────────────────────┐
+  ↓                          ↓
+sml_planning_node    ────   sml_manager_node
+Service /sml/get_plan  ↑ 
                          |
               ┌──────────┼──────────┐
               ↓          ↓          ↓
