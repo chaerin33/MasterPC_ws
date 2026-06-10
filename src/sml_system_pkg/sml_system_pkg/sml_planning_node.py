@@ -23,7 +23,7 @@ PRODUCT_NAMES = {
 class PlanningNode(Node):
 
     def __init__(self):
-        super().__init__('planning_node')
+        super().__init__('sml_planning_node')
 
         self.plan_generated = False
         self.steps = []
@@ -376,9 +376,7 @@ class PlanningNode(Node):
             # ------------------------------------------------
             wb_action  = Step.PRODUCE \
                 if wb_task['order_type'] == Order.OT_PRODUCE else Step.RECYCLE
-            wb_objects = wb_task['materials'] \
-                if wb_task['order_type'] == Order.OT_PRODUCE \
-                else [wb_task['product_id']]
+            wb_objects = [wb_task['product_id']]
 
             wb_depends = []
             if unload_step_id is not None:

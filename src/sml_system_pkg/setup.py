@@ -20,8 +20,9 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'planning_node = sml_system_pkg.planning_node:main',
             'order_server  = sml_system_pkg.order_server:main',
+            'sml_planning_node = sml_system_pkg.sml_planning_node:main',
+            'sml_manager_node  = sml_system_pkg.sml_manager_node:main',
         ],
     },
 )
