@@ -47,16 +47,18 @@ MasterPC_ws/src/
 
 ```
 sml_order_server
-      ↓ Topic /sml/task
-  ┌───┴──────────────────────┐
-  ↓                          ↓
-sml_planning_node    ────   sml_manager_node
-Service /sml/get_plan  ↑ 
-                         |
-              ┌──────────┼──────────┐
-              ↓          ↓          ↓
-        amr_nav_node  amr_robot_node  workbench_node
-        (자율주행팀)    (Manipulation)  (Manipulation)
+      ↓ /sml/task (Topic)
+  ┌───┴───────────┐
+  ↓               ↓
+sml_planning_node  sml_manager_node ─────────────────┐
+        ↑_________________↓                          |
+         /sml/get_plan (Service)                     |
+         매니저가 요청 → planning이 스텝 응답             |
+                                                     |
+                                          ┌──────────┼──────────┐
+                                          ↓          ↓          ↓
+                                    amr_nav_node  amr_robot_node  workbench_node
+                                    (자율주행팀)    (Manipulation)  (Manipulation)
 ```
 
 | 구분 | 방식 | 이름 | 설명 |
