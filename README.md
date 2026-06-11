@@ -78,16 +78,16 @@ sml_planning_node  sml_manager_node ──────────────�
 
 ```
 # Goal
-int32  station_id       # 이동할 스테이션 번호
-
----
-# Feedback
-string status           # "MOVING" / "ARRIVED"
+int32  station_id
 
 ---
 # Result
 bool   success
 string fail_reason      # "NAV_FAILED" / "OBSTACLE" / "TIMEOUT"
+
+---
+# Feedback
+string status           # "MOVING" / "ARRIVED"
 ```
 
 ### WbTask.action (Manipulation 전달용)
@@ -98,13 +98,13 @@ string  work_type       # "PRODUCE" / "RECYCLE"
 int32   product_id      # 만들거나 분해할 product_id (예: 13, 81)
 
 ---
-# Feedback
-string status           # "PROCESSING" / "PRODUCING" / "RECYCLING"
-
----
 # Result
 bool    success
 string  fail_reason
+
+---
+# Feedback
+string status           # "PROCESSING" / "PRODUCING" / "RECYCLING"
 ```
 
 ### ArmCommand.srv (amr_robot_ws 참고)
