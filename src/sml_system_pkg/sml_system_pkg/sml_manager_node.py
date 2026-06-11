@@ -349,7 +349,7 @@ class SmlManagerNode(Node):
         fb = feedback_msg.feedback
         self.get_logger().info(
             f'[WB] step {step.step_id} 진행 중: '
-            f'{fb.status} ({fb.progress_pct}%)')
+            f'{fb.status}')
 
     def _on_wb_accepted(self, future, step, retry):
         goal_handle = future.result()

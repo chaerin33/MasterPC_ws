@@ -1,391 +1,529 @@
 """
-sml_manager_node.py
-GetPlan 서비스로 스텝 목록을 받아
-depends_on 기반으로 AMR / WB를 병렬 실행하는 노드.
-
-통신:
-  구독  /sml/task          (sml_msgs/Task)
-  서비스 /sml/get_plan     (sml_msgs/GetPlan)   ← planning_node
-  Action navigate_to_station (sml_msgs/NavTask) → amr_nav_node
-  서비스 /amr_robot_command  (arm_interfaces/ArmCommand) → amr_robot_node
-  Action wb_task             (sml_msgs/WbTask)  → workbench_node
-  발행  /sml/status        (std_msgs/String)    모니터링용
+planning_node.py
+Task.msg를 수신해서 depends_on 기반 스텝 시퀀스를 생성하고
+ManagerNode 요청 시 전달하는 노드.
 """
 
-import threading
-
+import copy
 import rclpy
-from rclpy.action import ActionClient
-from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from std_msgs.msg import String
 
-from arm_interfaces.srv import ArmCommand
-from sml_msgs.action import NavTask, WbTask
-from sml_msgs.msg import Step, Task
+from sml_msgs.msg import Task, Order, Station, Step
 from sml_msgs.srv import GetPlan
 
 
-class SmlManagerNode(Node):
+PRODUCT_NAMES = {
+    34: 'Battery', 13: 'Magnet', 81: 'E-Stop',
+    442: 'Carrot', 241: 'Traffic Light', 462: 'Small Tree',
+    711: 'Hammer', 4482: 'Big Carrot', 8518: 'Burger',
+    48132: 'Ice Cream', 46262: 'Big Tree',
+}
+
+
+class PlanningNode(Node):
 
     def __init__(self):
-        super().__init__('sml_manager_node')
-        self.cbg = ReentrantCallbackGroup()
+        super().__init__('planning_node')
 
-        # ── 실행 상태 ──────────────────────────────────────
-        self._lock = threading.Lock()
-        self.pending_steps   = []       # 아직 실행 안 된 스텝
-        self.completed_steps = set()    # 완료된 step_id 집합
-        self.amr_busy        = False    # AMR 트랙 점유 여부
-        self.wb_busy         = False    # WB 트랙 점유 여부
-        self.plan_requested  = False    # GetPlan 요청 여부 (중복 방지)
+        self.plan_generated = False
+        self.steps = []
 
-        # GetPlan 재시도 관련
-        self._plan_retry_count = 0
-        self._plan_timer       = None
-
-        # ── Subscriber ─────────────────────────────────────
         self.task_sub = self.create_subscription(
-            Task, '/sml/task',
-            self.task_callback, 10,
-            callback_group=self.cbg)
+            Task, '/sml/task', self.task_callback, 10
+        )
+        self.plan_srv = self.create_service(
+            GetPlan, '/sml/get_plan', self.get_plan_callback
+        )
 
-        # ── Service Clients ────────────────────────────────
-        self.get_plan_client = self.create_client(
-            GetPlan, '/sml/get_plan',
-            callback_group=self.cbg)
-        self.arm_client = self.create_client(
-            ArmCommand, '/amr_robot_command',
-            callback_group=self.cbg)
+        self.get_logger().info('PlanningNode 시작')
 
-        # ── Action Clients ─────────────────────────────────
-        self.nav_client = ActionClient(
-            self, NavTask, 'navigate_to_station',
-            callback_group=self.cbg)
-        self.wb_client = ActionClient(
-            self, WbTask, 'wb_task',
-            callback_group=self.cbg)
+    # --------------------------------------------------------
+    # 콜백
+    # --------------------------------------------------------
 
-        # ── Status Publisher ───────────────────────────────
-        self.status_pub = self.create_publisher(
-            String, '/sml/status', 10)
-
-        self.get_logger().info('[MANAGER] sml_manager_node 시작')
-
-    # ──────────────────────────────────────────────────────
-    # Task 수신 → GetPlan 요청
-    # ──────────────────────────────────────────────────────
-
-    def task_callback(self, msg):
-        with self._lock:
-            if self.plan_requested:
-                return
-            self.plan_requested = True
-
-        self.get_logger().info('[MANAGER] Task 수신 → 1초 후 GetPlan 요청')
-        self._plan_retry_count = 0
-        # planning_node가 계획을 생성할 시간을 준 뒤 요청
-        self._plan_timer = self.create_timer(1.0, self._try_get_plan)
-
-    def _try_get_plan(self):
-        # create_timer는 반복 타이머이므로 여기서 cancel
-        if self._plan_timer:
-            self._plan_timer.cancel()
-            self._plan_timer = None
-
-        if not self.get_plan_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().error('[MANAGER] GetPlan 서비스 없음')
+    def task_callback(self, task):
+        if self.plan_generated:
             return
+        self.plan_generated = True
+        self.get_logger().info('Task 수신 → 계획 생성 시작')
+        self._build_plan(task)
 
-        future = self.get_plan_client.call_async(GetPlan.Request())
-        future.add_done_callback(self._on_get_plan_response)
+    def get_plan_callback(self, request, response):
+        if not self.plan_generated or not self.steps:
+            response.success = False
+            response.message = '계획이 아직 생성되지 않았습니다'
+            return response
+        response.steps = self.steps
+        response.success = True
+        response.message = ''
+        self.get_logger().info(f'GetPlan 응답: {len(self.steps)}개 스텝 전달')
+        return response
 
-    def _on_get_plan_response(self, future):
-        MAX_RETRY = 10
+    # --------------------------------------------------------
+    # 핵심 계획 생성 로직
+    # --------------------------------------------------------
 
+    def _build_plan(self, task):
         try:
-            response = future.result()
+            station_materials, wb_id, customer_id, storage_id = \
+                self._parse_arena(task.arena_layout)
+
+            produce_orders, recycle_orders = \
+                self._parse_orders(task.order_list)
+
+            virtual_stock = copy.deepcopy(station_materials)
+            recycle_releases = self._register_recycle_releases(recycle_orders)
+            self._assign_material_sources(produce_orders, recycle_releases, virtual_stock)
+            self._assign_waste_materials(recycle_orders, produce_orders)
+
+            wb_sequence = self._build_wb_sequence(produce_orders, recycle_orders)
+
+            self.steps = self._generate_steps(
+                wb_sequence, station_materials,
+                wb_id, customer_id, storage_id
+            )
+
+            self.get_logger().info(f'계획 생성 완료: {len(self.steps)}개 스텝')
+            self._log_plan_summary(produce_orders, recycle_orders)
+            self._log_steps(self.steps)
+
         except Exception as e:
-            self.get_logger().error(f'[MANAGER] GetPlan 호출 예외: {e}')
-            return
+            self.get_logger().error(f'계획 생성 실패: {e}')
+            self.plan_generated = False
 
-        if not response.success:
-            self._plan_retry_count += 1
-            if self._plan_retry_count <= MAX_RETRY:
-                self.get_logger().warn(
-                    f'[MANAGER] 계획 미생성, 재시도 '
-                    f'({self._plan_retry_count}/{MAX_RETRY})')
-                self._plan_timer = self.create_timer(0.5, self._try_get_plan)
+    # --------------------------------------------------------
+    # Step 1: 입력 파싱
+    # --------------------------------------------------------
+
+    def _parse_arena(self, arena_layout):
+        station_materials = {}
+        wb_id = customer_id = storage_id = None
+
+        for station in arena_layout:
+            station_materials[station.station_id] = list(station.material_ids)
+            if station.station_type == Station.ST_WORKBENCH:
+                wb_id = station.station_id
+            elif station.station_type == Station.ST_CUSTOMER:
+                customer_id = station.station_id
+            elif station.station_type == Station.ST_STORAGE and storage_id is None:
+                storage_id = station.station_id
+
+        return station_materials, wb_id, customer_id, storage_id
+
+    def _parse_orders(self, order_list):
+        produce_orders = []
+        recycle_orders = []
+
+        for order in order_list:
+            parsed = {
+                'order_type':       order.order_type,
+                'product_id':       order.product_id,
+                'materials':        self._parse_product_id(order.product_id),
+                # material_sources: [(material, source, dep_recycle), ...]
+                # 리스트로 관리해서 중복 재료도 개수 단위로 처리
+                'material_sources': [],
+                'waste_materials':  [],
+                'reuse_materials':  [],
+            }
+            if order.order_type == Order.OT_PRODUCE:
+                produce_orders.append(parsed)
+            elif order.order_type == Order.OT_RECYCLE:
+                recycle_orders.append(parsed)
+
+        produce_orders.sort(key=lambda o: len(o['materials']))
+        return produce_orders, recycle_orders
+
+    def _parse_product_id(self, product_id):
+        return [int(d) for d in str(product_id)]
+
+    # --------------------------------------------------------
+    # Step 2: 재료 출처 분류 + 가상 차감
+    # --------------------------------------------------------
+
+    def _register_recycle_releases(self, recycle_orders):
+        """RECYCLE 후 나올 재료 등록 → {material: [recycle_order, ...]} (개수 단위)"""
+        recycle_available = {}
+        for order in recycle_orders:
+            for material in order['materials']:
+                recycle_available.setdefault(material, []).append(order)
+        return recycle_available
+
+    def _assign_material_sources(self, produce_orders, recycle_available, virtual_stock):
+        """
+        재료 출처 결정 + 가상 차감
+        우선순위: RECYCLE 후 재료 → 재고
+        material_sources = [(material, source, dep_recycle), ...]
+        """
+        for order in produce_orders:
+            for material in order['materials']:
+
+                # 1순위: RECYCLE 후 WB에 생기는 재료
+                if material in recycle_available and recycle_available[material]:
+                    recycle_order = recycle_available[material].pop(0)
+                    order['material_sources'].append((material, 'WB', recycle_order))
+
+                # 2순위: 재고에서 가져오기
+                else:
+                    station_id = self._find_in_stock(material, virtual_stock)
+                    if station_id is not None:
+                        virtual_stock[station_id].remove(material)
+                        order['material_sources'].append((material, station_id, None))
+                    else:
+                        raise RuntimeError(f'재료 {material}를 구할 수 없음')
+
+    def _assign_waste_materials(self, recycle_orders, produce_orders):
+        """RECYCLE 후 재료 → reuse / waste 분류 (개수 단위)"""
+        needed = []
+        for order in produce_orders:
+            needed.extend(order['materials'])
+
+        remaining_needed = list(needed)
+        for order in recycle_orders:
+            for material in order['materials']:
+                if material in remaining_needed:
+                    order['reuse_materials'].append(material)
+                    remaining_needed.remove(material)
+                else:
+                    order['waste_materials'].append(material)
+
+    def _find_in_stock(self, material, stock):
+        for station_id, materials in stock.items():
+            if material in materials:
+                return station_id
+        return None
+
+    # --------------------------------------------------------
+    # Step 3: WB 시퀀스 결정
+    # --------------------------------------------------------
+
+    def _build_wb_sequence(self, produce_orders, recycle_orders):
+        """
+        1. 재고만으로 가능한 PRODUCE 먼저
+        2. RECYCLE 필요한 PRODUCE → 해당 RECYCLE과 묶어서
+        3. 독립 RECYCLE (어떤 PRODUCE와도 무관) → 마지막
+        4. PRODUCE 결과물 RECYCLE → 맨 마지막
+        """
+        produce_ids = {o['product_id'] for o in produce_orders}
+
+        # 각 PRODUCE가 의존하는 RECYCLE 파악
+        produce_recycle_deps = {}
+        for po in produce_orders:
+            deps = []
+            for (material, source, dep_recycle) in po['material_sources']:
+                if dep_recycle is not None and dep_recycle not in deps:
+                    deps.append(dep_recycle)
+            produce_recycle_deps[id(po)] = deps
+
+        after_recycles      = []
+        standalone_recycles = []
+
+        for ro in recycle_orders:
+            if ro['product_id'] in produce_ids:
+                after_recycles.append(ro)
             else:
-                self.get_logger().error('[MANAGER] GetPlan 최대 재시도 초과')
-            return
+                is_linked = any(
+                    ro in deps for deps in produce_recycle_deps.values()
+                )
+                if not is_linked:
+                    standalone_recycles.append(ro)
 
-        self.get_logger().info(
-            f'[MANAGER] 계획 수신 완료: {len(response.steps)}개 스텝')
-        self._log_steps(response.steps)
+        wb_sequence   = []
+        used_recycles = set()
 
-        with self._lock:
-            self.pending_steps = list(response.steps)
+        # 1. 재고만으로 가능한 PRODUCE
+        for po in produce_orders:
+            if not produce_recycle_deps[id(po)]:
+                wb_sequence.append(po)
 
-        self._dispatch()
+        # 2. RECYCLE 필요한 PRODUCE → 해당 RECYCLE과 묶음
+        for po in produce_orders:
+            deps = produce_recycle_deps[id(po)]
+            if deps:
+                for ro in deps:
+                    if id(ro) not in used_recycles:
+                        wb_sequence.append(ro)
+                        used_recycles.add(id(ro))
+                wb_sequence.append(po)
 
-    # ──────────────────────────────────────────────────────
-    # 스텝 디스패치 (핵심 로직)
-    # ──────────────────────────────────────────────────────
+        # 3. 독립 RECYCLE
+        wb_sequence.extend(standalone_recycles)
 
-    def _dispatch(self):
-        """ready 스텝을 찾아 AMR / WB 트랙에 각각 1개씩 실행."""
-        amr_step = None
-        wb_step  = None
+        # 4. PRODUCE 결과물 RECYCLE
+        wb_sequence.extend(after_recycles)
 
-        with self._lock:
-            for step in list(self.pending_steps):
-                deps_ok = all(
-                    d in self.completed_steps
-                    for d in step.depends_on)
-                if not deps_ok:
-                    continue
+        return wb_sequence
 
-                if step.type == Step.AMR and not self.amr_busy \
-                        and amr_step is None:
-                    self.amr_busy = True
-                    self.pending_steps.remove(step)
-                    amr_step = step
+    # --------------------------------------------------------
+    # Step 4: 스텝 시퀀스 생성
+    # --------------------------------------------------------
 
-                elif step.type == Step.WB and not self.wb_busy \
-                        and wb_step is None:
-                    self.wb_busy = True
-                    self.pending_steps.remove(step)
-                    wb_step = step
+    def _generate_steps(
+        self, wb_sequence, station_materials,
+        wb_id, customer_id, storage_id
+    ):
+        steps = []
+        step_id = 0
+        last_wb_step_id = None
 
-                if amr_step and wb_step:
-                    break
+        slot_1           = None
+        slot_material    = []
+        pending_loads    = []
+        loaded_materials = set()  # 중복 적재 방지
 
-            remaining = len(self.pending_steps)
-            all_done  = (remaining == 0
-                         and not self.amr_busy and not self.wb_busy
-                         and amr_step is None and wb_step is None)
+        for wb_task in wb_sequence:
 
-        # lock 밖에서 실행
-        if amr_step:
-            self.get_logger().info(
-                f'[MANAGER] AMR step {amr_step.step_id} 시작 '
-                f'(action={amr_step.action}, '
-                f'objects={list(amr_step.object_ids)}, '
-                f'station={amr_step.station_id})')
-            self._publish_status(
-                f'AMR step {amr_step.step_id} 실행 중')
-            self._execute_amr(amr_step)
+            # ------------------------------------------------
+            # RECYCLE: 분해 대상 슬롯 1에 Load
+            # ------------------------------------------------
+            if wb_task['order_type'] == Order.OT_RECYCLE:
 
-        if wb_step:
-            self.get_logger().info(
-                f'[MANAGER] WB step {wb_step.step_id} 시작 '
-                f'(action={wb_step.action}, '
-                f'objects={list(wb_step.object_ids)})')
-            self._publish_status(
-                f'WB step {wb_step.step_id} 실행 중')
-            self._execute_wb(wb_step)
+                if slot_1 is not None:
+                    step_id, last_wb_step_id = self._flush_unload(
+                        steps, step_id, pending_loads,
+                        slot_1, slot_material, wb_id, last_wb_step_id
+                    )
+                    slot_1        = None
+                    slot_material = []
+                    pending_loads = []
 
-        if all_done:
-            self.get_logger().info('[MANAGER] ✅ 모든 스텝 완료!')
-            self._publish_status('완료')
+                src = self._find_in_stock(wb_task['product_id'], station_materials)
+                steps.append(self._make_step(
+                    step_id, Step.AMR, Step.LOAD,
+                    [wb_task['product_id']], src, []
+                ))
+                pending_loads.append(step_id)
+                slot_1 = wb_task['product_id']
+                step_id += 1
 
-    def _on_step_complete(self, step_id):
-        with self._lock:
-            self.completed_steps.add(step_id)
-            self.get_logger().info(
-                f'[MANAGER] step {step_id} 완료 '
-                f'| 완료: {sorted(self.completed_steps)} '
-                f'| 남은 스텝: {len(self.pending_steps)}개')
-        self._dispatch()
+                # 다음 PRODUCE 재료 미리 적재 (재고에서 가져올 수 있는 것만)
+                preload_by_station = {}
+                for future_task in wb_sequence:
+                    if future_task['order_type'] != Order.OT_PRODUCE:
+                        continue
+                    for (material, source, dep) in future_task['material_sources']:
+                        if dep is None \
+                                and len(slot_material) < 5 \
+                                and material not in loaded_materials:
+                            preload_by_station.setdefault(source, []).append(material)
+                            slot_material.append(material)
+                            loaded_materials.add(material)
 
-    # ──────────────────────────────────────────────────────
-    # AMR 스텝 실행: NAV Action → ARM Service
-    # ──────────────────────────────────────────────────────
+                for source, materials in preload_by_station.items():
+                    steps.append(self._make_step(
+                        step_id, Step.AMR, Step.LOAD,
+                        materials, source, []
+                    ))
+                    pending_loads.append(step_id)
+                    step_id += 1
 
-    def _execute_amr(self, step, retry=0):
-        MAX_RETRY = 1
+            # ------------------------------------------------
+            # PRODUCE: 재료 Load
+            # ------------------------------------------------
+            elif wb_task['order_type'] == Order.OT_PRODUCE:
 
-        if not self.nav_client.wait_for_server(timeout_sec=2.0):
-            self.get_logger().warn(
-                f'[NAV] step {step.step_id}: nav 서버 없음 → 3초 후 재시도')
-            self.create_timer(
-                3.0, lambda s=step, r=retry: self._execute_amr(s, r))
-            return
+                needs_wb_material = any(
+                    dep is not None
+                    for (_, _, dep) in wb_task['material_sources']
+                )
 
-        goal = NavTask.Goal()
-        goal.station_id = step.station_id
+                if needs_wb_material and pending_loads:
+                    step_id, last_wb_step_id = self._flush_unload(
+                        steps, step_id, pending_loads,
+                        slot_1, slot_material, wb_id, last_wb_step_id
+                    )
+                    slot_1        = None
+                    slot_material = []
+                    pending_loads = []
 
-        self.get_logger().info(
-            f'[NAV] step {step.step_id} → station {step.station_id} 이동')
+                load_by_station = {}
+                for (material, source, dep) in wb_task['material_sources']:
+                    if dep is None and material not in loaded_materials:
+                        load_by_station.setdefault(source, []).append(material)
+                        slot_material.append(material)
+                        loaded_materials.add(material)
 
-        send_future = self.nav_client.send_goal_async(goal)
-        send_future.add_done_callback(
-            lambda f, s=step, r=retry: self._on_nav_accepted(f, s, r))
+                for source, materials in load_by_station.items():
+                    steps.append(self._make_step(
+                        step_id, Step.AMR, Step.LOAD,
+                        materials, source, []
+                    ))
+                    pending_loads.append(step_id)
+                    step_id += 1
 
-    def _on_nav_accepted(self, future, step, retry):
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error(
-                f'[NAV] step {step.step_id} goal 거절됨')
-            with self._lock:
-                self.amr_busy = False
-            return
+            # ------------------------------------------------
+            # WB Unload
+            # ------------------------------------------------
+            all_objects = (
+                ([slot_1] if slot_1 is not None else []) + slot_material
+            )
 
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(
-            lambda f, s=step, r=retry: self._on_nav_result(f, s, r))
+            if all_objects:
+                unload_depends = list(pending_loads)
+                if last_wb_step_id is not None:
+                    unload_depends.append(last_wb_step_id)
 
-    def _on_nav_result(self, future, step, retry):
-        MAX_RETRY = 1
-        result = future.result().result
-
-        if not result.success:
-            self.get_logger().error(
-                f'[NAV] step {step.step_id} 실패: {result.fail_reason}')
-            if retry < MAX_RETRY and result.fail_reason == 'NAV_FAILED':
-                self.get_logger().warn(
-                    f'[NAV] step {step.step_id} 재시도 ({retry+1}/{MAX_RETRY})')
-                self._execute_amr(step, retry + 1)
+                unload_step_id = step_id
+                steps.append(self._make_step(
+                    step_id, Step.AMR, Step.UNLOAD,
+                    all_objects, wb_id, unload_depends
+                ))
+                step_id += 1
             else:
-                self.get_logger().error(
-                    f'[NAV] step {step.step_id} 최종 실패')
-                with self._lock:
-                    self.amr_busy = False
-            return
+                unload_step_id = None
 
-        self.get_logger().info(
-            f'[NAV] step {step.step_id} 도착 완료 → ARM 실행')
-        self._execute_arm(step)
+            # ------------------------------------------------
+            # WB 작업 (PRODUCE or RECYCLE)
+            # ------------------------------------------------
+            wb_action  = Step.PRODUCE \
+                if wb_task['order_type'] == Order.OT_PRODUCE else Step.RECYCLE
+            # PRODUCE: 완성품 ID / RECYCLE: 분해 대상 ID
+            wb_objects = [wb_task['product_id']]
 
-    def _execute_arm(self, step, retry=0):
-        MAX_RETRY = 1
+            wb_depends = []
+            if unload_step_id is not None:
+                wb_depends.append(unload_step_id)
+            if last_wb_step_id is not None:
+                wb_depends.append(last_wb_step_id)
 
-        if not self.arm_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().error(
-                f'[ARM] step {step.step_id}: arm 서비스 없음')
-            with self._lock:
-                self.amr_busy = False
-            return
+            if wb_task['order_type'] == Order.OT_PRODUCE:
+                for (_, _, dep_recycle) in wb_task['material_sources']:
+                    if dep_recycle is not None:
+                        recycle_sid = self._find_wb_recycle_step_id(
+                            steps, dep_recycle['product_id']
+                        )
+                        if recycle_sid is not None and recycle_sid not in wb_depends:
+                            wb_depends.append(recycle_sid)
 
-        req = ArmCommand.Request()
-        req.action     = 'LOAD' if step.action == Step.LOAD else 'UNLOAD'
-        req.object_ids = list(step.object_ids)
-        req.location   = ''
+            steps.append(self._make_step(
+                step_id, Step.WB, wb_action,
+                wb_objects, wb_id, wb_depends
+            ))
+            last_wb_step_id = step_id
+            step_id += 1
 
-        self.get_logger().info(
-            f'[ARM] step {step.step_id} → '
-            f'{req.action} {list(step.object_ids)}')
+            # ------------------------------------------------
+            # PRODUCE 완료 후: 완성품 납품
+            # ------------------------------------------------
+            if wb_task['order_type'] == Order.OT_PRODUCE:
+                load_sid = step_id
+                steps.append(self._make_step(
+                    step_id, Step.AMR, Step.LOAD,
+                    [wb_task['product_id']], wb_id, [last_wb_step_id]
+                ))
+                step_id += 1
+                steps.append(self._make_step(
+                    step_id, Step.AMR, Step.UNLOAD,
+                    [wb_task['product_id']], customer_id, [load_sid]
+                ))
+                step_id += 1
 
-        future = self.arm_client.call_async(req)
-        future.add_done_callback(
-            lambda f, s=step, r=retry: self._on_arm_result(f, s, r))
+            # ------------------------------------------------
+            # RECYCLE 완료 후: 불필요 재료 Storage 반납
+            # ------------------------------------------------
+            if wb_task['order_type'] == Order.OT_RECYCLE \
+                    and wb_task['waste_materials']:
+                load_sid = step_id
+                steps.append(self._make_step(
+                    step_id, Step.AMR, Step.LOAD,
+                    wb_task['waste_materials'], wb_id, [last_wb_step_id]
+                ))
+                step_id += 1
+                steps.append(self._make_step(
+                    step_id, Step.AMR, Step.UNLOAD,
+                    wb_task['waste_materials'], storage_id, [load_sid]
+                ))
+                step_id += 1
 
-    def _on_arm_result(self, future, step, retry):
-        MAX_RETRY = 1
+            slot_1        = None
+            slot_material = []
+            pending_loads = []
 
-        try:
-            response = future.result()
-        except Exception as e:
-            self.get_logger().error(
-                f'[ARM] step {step.step_id} 예외: {e}')
-            with self._lock:
-                self.amr_busy = False
-            return
+        return steps
 
-        if not response.success:
-            self.get_logger().error(
-                f'[ARM] step {step.step_id} 실패: {response.message}')
-            # OBJECT_NOT_FOUND는 재시도 의미 없음
-            retriable = 'object not found' not in response.message.lower()
-            if retry < MAX_RETRY and retriable:
-                self.get_logger().warn(
-                    f'[ARM] step {step.step_id} 재시도 ({retry+1}/{MAX_RETRY})')
-                self._execute_arm(step, retry + 1)
-            else:
-                self.get_logger().error(
-                    f'[ARM] step {step.step_id} 최종 실패')
-                with self._lock:
-                    self.amr_busy = False
-            return
+    # --------------------------------------------------------
+    # 헬퍼 함수
+    # --------------------------------------------------------
 
-        self.get_logger().info(
-            f'[ARM] step {step.step_id} 완료 '
-            f'| slots={list(response.slots)}')
-        with self._lock:
-            self.amr_busy = False
-        self._on_step_complete(step.step_id)
+    def _make_step(self, step_id, type_, action, object_ids, station_id, depends_on):
+        step = Step()
+        step.step_id    = step_id
+        step.type       = type_
+        step.action     = action
+        step.object_ids = list(object_ids)
+        step.station_id = station_id if station_id is not None else -1
+        step.depends_on = list(depends_on)
+        return step
 
-    # ──────────────────────────────────────────────────────
-    # WB 스텝 실행
-    # ──────────────────────────────────────────────────────
+    def _flush_unload(
+        self, steps, step_id, pending_loads,
+        slot_1, slot_material, wb_id, last_wb_step_id
+    ):
+        unload_depends = list(pending_loads)
+        if last_wb_step_id is not None:
+            unload_depends.append(last_wb_step_id)
+        all_objects = (([slot_1] if slot_1 is not None else []) + slot_material)
+        steps.append(self._make_step(
+            step_id, Step.AMR, Step.UNLOAD,
+            all_objects, wb_id, unload_depends
+        ))
+        return step_id + 1, last_wb_step_id
 
-    def _execute_wb(self, step, retry=0):
-        if not self.wb_client.wait_for_server(timeout_sec=2.0):
-            self.get_logger().warn(
-                f'[WB] step {step.step_id}: WB 서버 없음 → 3초 후 재시도')
-            self.create_timer(
-                3.0, lambda s=step, r=retry: self._execute_wb(s, r))
-            return
+    def _find_wb_recycle_step_id(self, steps, product_id):
+        for step in steps:
+            if step.type == Step.WB and step.action == Step.RECYCLE:
+                if product_id in step.object_ids:
+                    return step.step_id
+        return None
 
-        goal = WbTask.Goal()
-        goal.work_type  = ('PRODUCE'
-                           if step.action == Step.PRODUCE
-                           else 'RECYCLE')
-        goal.product_id = step.object_ids[0]  # [13] 또는 [81]의 첫 번째
+    # --------------------------------------------------------
+    # 로그
+    # --------------------------------------------------------
 
-        self.get_logger().info(
-            f'[WB] step {step.step_id} → '
-            f'{goal.work_type} {list(step.object_ids)}')
+    def _log_plan_summary(self, produce_orders, recycle_orders):
+        def name(pid):
+            return PRODUCT_NAMES.get(pid, str(pid))
 
-        send_future = self.wb_client.send_goal_async(
-            goal,
-            feedback_callback=lambda fb, s=step: self._on_wb_feedback(fb, s))
-        send_future.add_done_callback(
-            lambda f, s=step, r=retry: self._on_wb_accepted(f, s, r))
+        self.get_logger().info('===== 실행 계획 요약 =====')
 
-    def _on_wb_feedback(self, feedback_msg, step):
-        fb = feedback_msg.feedback
-        self.get_logger().info(
-            f'[WB] step {step.step_id} 진행 중: {fb.status}')
+        for order in recycle_orders:
+            pid = order['product_id']
+            self.get_logger().info(f'[RECYCLE] {pid} ({name(pid)})')
+            self.get_logger().info(f'  -> 분해 후: {order["materials"]}')
+            if order['reuse_materials']:
+                # reuse 재료별로 어느 PRODUCE에 사용되는지 표시
+                # material_sources가 리스트라 중복 재료도 순서대로 매핑 가능
+                reuse_info = []
+                reuse_remaining = list(order['reuse_materials'])
+                for po in produce_orders:
+                    for (material, source, dep_recycle) in po['material_sources']:
+                        if dep_recycle is order and material in reuse_remaining:
+                            reuse_remaining.remove(material)
+                            reuse_info.append(
+                                f'{material} -> PRODUCE {po["product_id"]}'
+                            )
+                self.get_logger().info(
+                    f'  -> reuse : {order["reuse_materials"]}  ({" / ".join(reuse_info)})'
+                )
+            if order['waste_materials']:
+                self.get_logger().info(
+                    f'  -> waste : {order["waste_materials"]}  -> Storage 반납'
+                )
 
-    def _on_wb_accepted(self, future, step, retry):
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error(
-                f'[WB] step {step.step_id} goal 거절됨')
-            with self._lock:
-                self.wb_busy = False
-            return
+        for order in produce_orders:
+            pid = order['product_id']
+            self.get_logger().info(f'[PRODUCE] {pid} ({name(pid)})')
+            self.get_logger().info(f'  -> 재료: {order["materials"]}')
+            for (material, source, dep_recycle) in order['material_sources']:
+                if dep_recycle is not None:
+                    self.get_logger().info(
+                        f'  -> {material} : RECYCLE {dep_recycle["product_id"]} 후 WB에서 재사용'
+                    )
+                else:
+                    self.get_logger().info(
+                        f'  -> {material} : station={source} 에서 Load'
+                    )
 
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(
-            lambda f, s=step, r=retry: self._on_wb_result(f, s, r))
-
-    def _on_wb_result(self, future, step, retry):
-        result = future.result().result
-
-        if not result.success:
-            self.get_logger().error(
-                f'[WB] step {step.step_id} 실패: {result.fail_reason}')
-            with self._lock:
-                self.wb_busy = False
-            return
-
-        self.get_logger().info(f'[WB] step {step.step_id} 완료')
-        with self._lock:
-            self.wb_busy = False
-        self._on_step_complete(step.step_id)
-
-    # ──────────────────────────────────────────────────────
-    # 유틸리티
-    # ──────────────────────────────────────────────────────
-
-    def _publish_status(self, msg: str):
-        status = String()
-        status.data = msg
-        self.status_pub.publish(status)
+        self.get_logger().info('==========================')
 
     def _log_steps(self, steps):
         type_map   = {Step.AMR: 'AMR', Step.WB: 'WB '}
@@ -395,30 +533,28 @@ class SmlManagerNode(Node):
             Step.PRODUCE: 'PRODUCE',
             Step.RECYCLE: 'RECYCLE',
         }
-        self.get_logger().info('===== 수신된 스텝 시퀀스 =====')
+        self.get_logger().info('===== 스텝 시퀀스 =====')
         for s in steps:
             self.get_logger().info(
-                f'[{s.step_id:2d}] {type_map.get(s.type, "??")} | '
-                f'{action_map.get(s.action, "?")} | '
+                f'[{s.step_id:2d}] {type_map[s.type]} | '
+                f'{action_map[s.action]} | '
                 f'objects={list(s.object_ids)} | '
                 f'station={s.station_id} | '
-                f'depends_on={list(s.depends_on)}')
-        self.get_logger().info('==============================')
+                f'depends_on={list(s.depends_on)}'
+            )
+        self.get_logger().info('======================')
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = SmlManagerNode()
-    executor = MultiThreadedExecutor(num_threads=4)
-    executor.add_node(node)
+    node = PlanningNode()
     try:
-        executor.spin()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
